@@ -116,6 +116,27 @@ bom bom update-qty blight v1 a1b2c3d4 5
 bom bom remove blight v1 a1b2c3d4
 ```
 
+### 9 — Copy a version (for design iterations)
+
+```bash
+bom version copy blight v1 v2
+bom version copy blight v1 v2 --notes "Changed caps to X7R"
+```
+
+All BOM items are duplicated into the new version with fresh IDs.
+Changes to `v2` do not affect `v1`.
+
+### 10 — Diff two versions
+
+```bash
+bom bom diff blight v1 v2
+```
+
+Shows a color-coded table:
+- **Green `+`** — part added in `v2`
+- **Red `-`** — part removed (was in `v1`)
+- **Yellow `~`** — part changed (quantity, price, or reference designator)
+
 ---
 
 ## All commands at a glance
@@ -127,6 +148,8 @@ bom project delete  <name>
 
 bom version create  <project>  <version>  [--notes "..."]
 bom version list    <project>
+bom version delete  <project>  <version>  [--yes]
+bom version copy    <project>  <source>   <new>  [--notes "..."]
 
 bom bom add         <project>  <version>  "<part name>"  --qty N  [--ref D]
 bom bom list        <project>  <version>
@@ -134,6 +157,7 @@ bom bom remove      <project>  <version>  <item-id>
 bom bom update-qty  <project>  <version>  <item-id>  <new-qty>
 bom bom cost        <project>  <version>  [--boards N]
 bom bom export      <project>  <version>  [--format csv|xlsx]  [--output-dir DIR]
+bom bom diff        <project>  <version-a>  <version-b>
 ```
 
 > **Item ID** — the 8-character code shown in the rightmost column of `bom bom list`.

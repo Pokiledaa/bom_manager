@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import csv
 import logging
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from bom_manager.core.exceptions import (
     ExportError,
@@ -15,7 +16,7 @@ from bom_manager.core.exceptions import (
     SupplierLookupError,
     VersionNotFoundError,
 )
-from bom_manager.core.models import BOMItem, BOMSummary, PriceBreak
+from bom_manager.core.models import BOMItem, BOMSummary, PriceBreak, ProjectVersion
 from bom_manager.storage.base import StorageProtocol
 from bom_manager.suppliers.base import PartDetail, PartResult, SupplierError, SupplierProtocol
 
@@ -56,7 +57,7 @@ class BOMService:
     def __init__(
         self,
         storage: StorageProtocol,
-        supplier: SupplierProtocol,
+        supplier: Optional[SupplierProtocol] = None,
         export_dir: Path = _EXPORT_DIR,
     ) -> None:
         self._storage = storage
@@ -77,6 +78,8 @@ class BOMService:
         Returns an empty list when nothing matches.
         May raise ``SupplierError`` on network failures.
         """
+        if self._supplier is None:
+            raise RuntimeError("No supplier configured — create BOMService with a supplier to use search")
         return self._supplier.search(query)
 
     # ------------------------------------------------------------------
@@ -131,6 +134,9 @@ class BOMService:
         # Guard: version must exist
         if self._storage.get_version(version_id) is None:
             raise VersionNotFoundError(f"Version {version_id} not found")
+
+        if self._supplier is None:
+            raise RuntimeError("No supplier configured — create BOMService with a supplier to use add_part")
 
         # Resolve supplier PN via search when not explicitly provided
         if supplier_pn is None:
@@ -323,6 +329,122 @@ class BOMService:
         return path
 
     # ------------------------------------------------------------------
+    # Version copy
+    # ------------------------------------------------------------------
+
+    def copy_version(
+        self,
+        source_version_id: UUID,
+        new_version_name: str,
+        *,
+        notes: Optional[str] = None,
+    ) -> ProjectVersion:
+        """
+        Duplicate a BOM version under the same project.
+
+        All BOM items from *source_version_id* are copied into the new version
+        with fresh UUIDs so that changes to the copy do not affect the source.
+
+        Parameters
+        ----------
+        source_version_id:
+            UUID of the version to copy from.
+        new_version_name:
+            Name for the new version (e.g. ``"v2"``).
+        notes:
+            Optional notes for the new version.
+
+        Returns
+        -------
+        ProjectVersion
+            The newly created version.
+
+        Raises
+        ------
+        VersionNotFoundError
+            If *source_version_id* does not exist.
+        """
+        source = self._storage.get_version(source_version_id)
+        if source is None:
+            raise VersionNotFoundError(f"Version {source_version_id} not found")
+
+        new_ver = self._storage.create_version(
+            ProjectVersion(
+                project_id=source.project_id,
+                version_name=new_version_name,
+                notes=notes,
+            )
+        )
+
+        items = self._storage.list_items_by_version(source_version_id)
+        for item in items:
+            self._storage.add_item(
+                item.model_copy(update={"id": uuid4(), "version_id": new_ver.id})
+            )
+
+        log.info(
+            "Copied version %s → %r (new id=%s), %d item(s)",
+            source_version_id, new_version_name, new_ver.id, len(items),
+        )
+        return new_ver
+
+    # ------------------------------------------------------------------
+    # Version diff
+    # ------------------------------------------------------------------
+
+    def diff_versions(
+        self,
+        version_a_id: UUID,
+        version_b_id: UUID,
+    ) -> "VersionDiff":
+        """
+        Compare two BOM versions and return added/removed/changed items.
+
+        Items are matched by ``supplier_part_number`` when available,
+        falling back to ``matched_mpn``, then ``reference_designator``.
+
+        Parameters
+        ----------
+        version_a_id:
+            The "before" version (baseline).
+        version_b_id:
+            The "after" version (comparison target).
+
+        Returns
+        -------
+        VersionDiff
+            Structured diff with ``added``, ``removed``, and ``changed`` lists.
+
+        Raises
+        ------
+        VersionNotFoundError
+            If either version does not exist.
+        """
+        if self._storage.get_version(version_a_id) is None:
+            raise VersionNotFoundError(f"Version {version_a_id} not found")
+        if self._storage.get_version(version_b_id) is None:
+            raise VersionNotFoundError(f"Version {version_b_id} not found")
+
+        items_a = self._storage.list_items_by_version(version_a_id)
+        items_b = self._storage.list_items_by_version(version_b_id)
+
+        map_a = {_item_key(i): i for i in items_a}
+        map_b = {_item_key(i): i for i in items_b}
+
+        keys_a = set(map_a)
+        keys_b = set(map_b)
+
+        removed = [map_a[k] for k in sorted(keys_a - keys_b)]
+        added = [map_b[k] for k in sorted(keys_b - keys_a)]
+        changed = [
+            (map_a[k], map_b[k])
+            for k in sorted(keys_a & keys_b)
+            if _items_differ(map_a[k], map_b[k])
+        ]
+
+        return VersionDiff(added=added, removed=removed, changed=changed)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -468,3 +590,43 @@ def _write_xlsx(path: Path, summary: BOMSummary) -> None:
     ws.cell(row=total_row, column=8).font = Font(bold=True)
 
     wb.save(path)
+
+
+# ---------------------------------------------------------------------------
+# Version diff helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VersionDiff:
+    """Result of comparing two BOM versions."""
+
+    added: list[BOMItem] = field(default_factory=list)
+    """Items present in version B but not in version A."""
+
+    removed: list[BOMItem] = field(default_factory=list)
+    """Items present in version A but not in version B."""
+
+    changed: list[tuple[BOMItem, BOMItem]] = field(default_factory=list)
+    """(old_item, new_item) pairs where the item exists in both versions
+    but has at least one differing field."""
+
+    @property
+    def is_identical(self) -> bool:
+        """True when both versions contain exactly the same items."""
+        return not self.added and not self.removed and not self.changed
+
+
+def _item_key(item: BOMItem) -> str:
+    """Stable identity key used to match items across versions."""
+    return item.supplier_part_number or item.matched_mpn or item.reference_designator
+
+
+def _items_differ(a: BOMItem, b: BOMItem) -> bool:
+    """Return True if any user-visible field differs between two items."""
+    return (
+        a.quantity != b.quantity
+        or a.reference_designator != b.reference_designator
+        or a.user_part_name != b.user_part_name
+        or a.effective_unit_price() != b.effective_unit_price()
+    )

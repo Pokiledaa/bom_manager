@@ -46,6 +46,7 @@ class _Services:
         self._supplier = None
         self._project_svc = None
         self._bom_svc = None
+        self._bom_svc_ro = None
 
     # ── storage ───────────────────────────────────────────────────────────
 
@@ -81,6 +82,13 @@ class _Services:
             from bom_manager.core.bom_service import BOMService
             self._bom_svc = BOMService(self.storage(), self.supplier())
         return self._bom_svc
+
+    def bom_service_ro(self):
+        """BOM service without supplier — for copy, diff, and other read operations."""
+        if self._bom_svc_ro is None:
+            from bom_manager.core.bom_service import BOMService
+            self._bom_svc_ro = BOMService(self.storage())
+        return self._bom_svc_ro
 
     # ── cleanup ───────────────────────────────────────────────────────────
 
@@ -289,6 +297,67 @@ def version_list(svc: _Services, project_name: str) -> None:
             str(v.id)[:8],
         )
     console.print(tbl)
+
+
+@version.command("delete")
+@click.argument("project_name")
+@click.argument("version_name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@click.pass_obj
+def version_delete(
+    svc: _Services,
+    project_name: str,
+    version_name: str,
+    yes: bool,
+) -> None:
+    """Delete a BOM version and all its items."""
+    _, ver = _resolve_version(svc, project_name, version_name)
+
+    if not yes:
+        if not Confirm.ask(
+            f"Delete version [bold]{ver.version_name}[/] and [bold red]all[/] its BOM items?",
+            default=False,
+        ):
+            console.print("[dim]Aborted.[/]")
+            return
+
+    svc.storage().delete_version(ver.id)
+    console.print(
+        f"[green]✓[/] Deleted version [bold]{ver.version_name}[/] "
+        f"[dim]({str(ver.id)[:8]})[/]"
+    )
+
+
+@version.command("copy")
+@click.argument("project_name")
+@click.argument("source_version")
+@click.argument("new_version")
+@click.option("--notes", "-n", default=None, metavar="TEXT", help="Notes for the new version")
+@click.pass_obj
+def version_copy(
+    svc: _Services,
+    project_name: str,
+    source_version: str,
+    new_version: str,
+    notes: Optional[str],
+) -> None:
+    """Copy a BOM version to a new version (all items are duplicated)."""
+    project, src_ver = _resolve_version(svc, project_name, source_version)
+
+    try:
+        new_ver = svc.bom_service_ro().copy_version(
+            src_ver.id, new_version, notes=notes
+        )
+    except BOMManagerError as exc:
+        _die(str(exc))
+
+    items = svc.storage().list_items_by_version(new_ver.id)
+    console.print(
+        f"[green]✓[/] Copied [bold]{project.name}[/] / [bold]{src_ver.version_name}[/] "
+        f"→ [bold]{new_ver.version_name}[/]  "
+        f"[dim]({len(items)} item{'s' if len(items) != 1 else ''} copied · "
+        f"id={str(new_ver.id)[:8]})[/]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -749,3 +818,123 @@ def bom_cost(
         console.print(
             f"  [dim]No price tier improvement at {boards:,} boards for this BOM.[/]\n"
         )
+
+
+# ── bom diff ──────────────────────────────────────────────────────────────────
+
+@bom.command("diff")
+@click.argument("project_name")
+@click.argument("version_a")
+@click.argument("version_b")
+@click.pass_obj
+def bom_diff(
+    svc: _Services,
+    project_name: str,
+    version_a: str,
+    version_b: str,
+) -> None:
+    """Show what changed between two BOM versions.
+
+    \b
+    Color coding:
+      green  — part added in VERSION_B
+      red    — part removed (was in VERSION_A)
+      yellow — part changed (quantity, price, or reference)
+    """
+    project, ver_a = _resolve_version(svc, project_name, version_a)
+    _, ver_b = _resolve_version(svc, project_name, version_b)
+
+    try:
+        diff = svc.bom_service_ro().diff_versions(ver_a.id, ver_b.id)
+    except BOMManagerError as exc:
+        _die(str(exc))
+
+    if diff.is_identical:
+        console.print(
+            f"[dim]Versions [bold]{version_a}[/] and [bold]{version_b}[/] "
+            f"are identical — no differences found.[/]"
+        )
+        return
+
+    tbl = Table(
+        title=(
+            f"[bold cyan]{project.name}[/]  ·  "
+            f"[bold]{version_a}[/] → [bold]{version_b}[/]"
+        ),
+        box=box.ROUNDED,
+        show_lines=True,
+        pad_edge=True,
+    )
+    tbl.add_column("",       width=2, no_wrap=True)          # status icon
+    tbl.add_column("Ref",    style="dim",   no_wrap=True)
+    tbl.add_column("MPN",    style="cyan",  no_wrap=True)
+    tbl.add_column("LCSC #", style="dim",   no_wrap=True)
+    tbl.add_column("Qty",    justify="right")
+    tbl.add_column("Unit Price", justify="right")
+    tbl.add_column("Changes")
+
+    def _row_added(item):
+        tbl.add_row(
+            "[bold green]+[/]",
+            item.reference_designator,
+            item.matched_mpn or item.user_part_name,
+            item.supplier_part_number or "—",
+            str(item.quantity),
+            _fmt_price(item.effective_unit_price()),
+            "[green]added[/]",
+            style="green",
+        )
+
+    def _row_removed(item):
+        tbl.add_row(
+            "[bold red]-[/]",
+            item.reference_designator,
+            item.matched_mpn or item.user_part_name,
+            item.supplier_part_number or "—",
+            str(item.quantity),
+            _fmt_price(item.effective_unit_price()),
+            "[red]removed[/]",
+            style="red",
+        )
+
+    def _row_changed(old, new):
+        changes = []
+        if old.quantity != new.quantity:
+            changes.append(f"qty {old.quantity}→{new.quantity}")
+        if old.reference_designator != new.reference_designator:
+            changes.append(f"ref {old.reference_designator}→{new.reference_designator}")
+        if old.user_part_name != new.user_part_name:
+            changes.append(f"name changed")
+        price_old = old.effective_unit_price()
+        price_new = new.effective_unit_price()
+        if price_old != price_new:
+            changes.append(f"price {_fmt_price(price_old)}→{_fmt_price(price_new)}")
+
+        tbl.add_row(
+            "[bold yellow]~[/]",
+            new.reference_designator,
+            new.matched_mpn or new.user_part_name,
+            new.supplier_part_number or "—",
+            str(new.quantity),
+            _fmt_price(new.effective_unit_price()),
+            "[yellow]" + ", ".join(changes) + "[/]",
+            style="yellow",
+        )
+
+    for item in diff.removed:
+        _row_removed(item)
+    for item in diff.added:
+        _row_added(item)
+    for old, new in diff.changed:
+        _row_changed(old, new)
+
+    console.print(tbl)
+
+    parts = []
+    if diff.added:
+        parts.append(f"[green]{len(diff.added)} added[/]")
+    if diff.removed:
+        parts.append(f"[red]{len(diff.removed)} removed[/]")
+    if diff.changed:
+        parts.append(f"[yellow]{len(diff.changed)} changed[/]")
+    console.print("  " + "  ·  ".join(parts))
