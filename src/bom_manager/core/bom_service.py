@@ -282,7 +282,7 @@ class BOMService:
         version_id:
             UUID of the version to export.
         format:
-            Export format.  Only ``"csv"`` is supported currently.
+            Export format.  ``"csv"`` or ``"xlsx"``.
         output_dir:
             Directory to write the file into.  Defaults to ``exports/``.
         filename:
@@ -300,19 +300,22 @@ class BOMService:
         ExportError
             If the file cannot be written.
         """
-        if format != "csv":
+        if format not in ("csv", "xlsx"):
             raise ValueError(
-                f"Unsupported export format {format!r}. Supported: 'csv'"
+                f"Unsupported export format {format!r}. Supported: 'csv', 'xlsx'"
             )
 
         summary = self.get_bom(version_id)
         out_dir = output_dir or self._export_dir
         stem = filename or f"bom_{version_id}"
-        path = (out_dir / f"{stem}.csv").resolve()
+        path = (out_dir / f"{stem}.{format}").resolve()
 
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
-            _write_csv(path, summary)
+            if format == "csv":
+                _write_csv(path, summary)
+            else:
+                _write_xlsx(path, summary)
         except OSError as exc:
             raise ExportError(f"Could not write export to {path}: {exc}") from exc
 
@@ -392,22 +395,70 @@ def _build_item(
     )
 
 
+def _item_row(item: BOMItem) -> list:
+    """Return a flat list of cell values for one BOMItem."""
+    unit_price = item.effective_unit_price()
+    total = item.calculate_total()
+    return [
+        item.reference_designator,
+        item.user_part_name,
+        item.matched_mpn or "",
+        item.supplier or "",
+        item.supplier_part_number or "",
+        item.supplier_url or "",
+        item.quantity,
+        float(unit_price) if unit_price is not None else "",
+        float(total) if total is not None else "",
+    ]
+
+
 def _write_csv(path: Path, summary: BOMSummary) -> None:
     """Write *summary* to a CSV file at *path*."""
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(_CSV_HEADERS)
         for item in summary.items:
-            unit_price = item.effective_unit_price()
-            total = item.calculate_total()
-            writer.writerow([
-                item.reference_designator,
-                item.user_part_name,
-                item.matched_mpn or "",
-                item.supplier or "",
-                item.supplier_part_number or "",
-                item.supplier_url or "",
-                item.quantity,
-                f"{unit_price:.4f}" if unit_price is not None else "",
-                f"{total:.4f}" if total is not None else "",
-            ])
+            row = _item_row(item)
+            # Format numeric prices as strings for CSV readability
+            row[7] = f"{row[7]:.4f}" if row[7] != "" else ""
+            row[8] = f"{row[8]:.4f}" if row[8] != "" else ""
+            writer.writerow(row)
+
+
+def _write_xlsx(path: Path, summary: BOMSummary) -> None:
+    """Write *summary* to an Excel workbook at *path*."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "BOM"
+
+    # Header row
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF")
+    for col, header in enumerate(_CSV_HEADERS, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    # Data rows
+    for row_idx, item in enumerate(summary.items, 2):
+        for col_idx, value in enumerate(_item_row(item), 1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    # Auto-width columns
+    for col in ws.columns:
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 60)
+
+    # Total row
+    total_row = len(summary.items) + 2
+    ws.cell(row=total_row, column=8, value="TOTAL")
+    ws.cell(row=total_row, column=8).font = Font(bold=True)
+    ws.cell(row=total_row, column=9, value=float(summary.total_cost))
+    ws.cell(row=total_row, column=9).font = Font(bold=True)
+
+    wb.save(path)
