@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Package manager
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Database / storage
+data/
+
+# Playwright browser binaries and state
+.playwright/
+playwright-report/
+
+# Test / debug script outputs
+scripts/output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
