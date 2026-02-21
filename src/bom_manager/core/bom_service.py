@@ -25,15 +25,15 @@ _EXPORT_DIR = Path("exports")
 
 # CSV column headers, in output order
 _CSV_HEADERS = [
-    "Reference Designator",
+    "Reference",
     "Part Name",
     "MPN",
     "Supplier",
     "Supplier PN",
-    "Supplier URL",
     "Quantity",
-    "Unit Price (USD)",
-    "Total Price (USD)",
+    "Unit Price",
+    "Total Price",
+    "URL",
 ]
 
 
@@ -396,19 +396,25 @@ def _build_item(
 
 
 def _item_row(item: BOMItem) -> list:
-    """Return a flat list of cell values for one BOMItem."""
+    """
+    Return a flat list of cell values for one BOMItem.
+
+    Column order matches _CSV_HEADERS:
+    Reference | Part Name | MPN | Supplier | Supplier PN |
+    Quantity  | Unit Price | Total Price | URL
+    """
     unit_price = item.effective_unit_price()
     total = item.calculate_total()
     return [
-        item.reference_designator,
-        item.user_part_name,
-        item.matched_mpn or "",
-        item.supplier or "",
-        item.supplier_part_number or "",
-        item.supplier_url or "",
-        item.quantity,
-        float(unit_price) if unit_price is not None else "",
-        float(total) if total is not None else "",
+        item.reference_designator,                          # 0 Reference
+        item.user_part_name,                                # 1 Part Name
+        item.matched_mpn or "",                             # 2 MPN
+        item.supplier or "",                                # 3 Supplier
+        item.supplier_part_number or "",                    # 4 Supplier PN
+        item.quantity,                                      # 5 Quantity
+        float(unit_price) if unit_price is not None else "",  # 6 Unit Price
+        float(total) if total is not None else "",          # 7 Total Price
+        item.supplier_url or "",                            # 8 URL
     ]
 
 
@@ -420,8 +426,8 @@ def _write_csv(path: Path, summary: BOMSummary) -> None:
         for item in summary.items:
             row = _item_row(item)
             # Format numeric prices as strings for CSV readability
+            row[6] = f"{row[6]:.4f}" if row[6] != "" else ""
             row[7] = f"{row[7]:.4f}" if row[7] != "" else ""
-            row[8] = f"{row[8]:.4f}" if row[8] != "" else ""
             writer.writerow(row)
 
 
@@ -454,11 +460,11 @@ def _write_xlsx(path: Path, summary: BOMSummary) -> None:
         max_len = max(len(str(cell.value or "")) for cell in col)
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 60)
 
-    # Total row
+    # Total row  (col 7 = Unit Price label, col 8 = Total Price value)
     total_row = len(summary.items) + 2
-    ws.cell(row=total_row, column=8, value="TOTAL")
+    ws.cell(row=total_row, column=7, value="TOTAL")
+    ws.cell(row=total_row, column=7).font = Font(bold=True)
+    ws.cell(row=total_row, column=8, value=float(summary.total_cost))
     ws.cell(row=total_row, column=8).font = Font(bold=True)
-    ws.cell(row=total_row, column=9, value=float(summary.total_cost))
-    ws.cell(row=total_row, column=9).font = Font(bold=True)
 
     wb.save(path)

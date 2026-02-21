@@ -606,8 +606,8 @@ def bom_export(
 @bom.command("cost")
 @click.argument("project_name")
 @click.argument("version_name")
-@click.option("--boards", "-n", default=1, type=int, show_default=True,
-              help="Number of boards to calculate cost for")
+@click.option("--boards", "-n", default=100, type=int, show_default=True,
+              help="Number of boards to compare against 1-board pricing")
 @click.pass_obj
 def bom_cost(
     svc: _Services,
@@ -615,9 +615,9 @@ def bom_cost(
     version_name: str,
     boards: int,
 ) -> None:
-    """Show per-board cost and total for N boards (respects bulk price tiers)."""
-    if boards < 1:
-        _die("--boards must be >= 1")
+    """Compare per-board cost: 1 board vs N boards (shows bulk price tier savings)."""
+    if boards < 2:
+        _die("--boards must be >= 2 (use bom list for single-board cost)")
 
     project, ver = _resolve_version(svc, project_name, version_name)
 
@@ -630,50 +630,122 @@ def bom_cost(
         console.print("[dim]BOM is empty.[/]")
         return
 
-    # For N boards, scale each item quantity and find the applicable price tier
-    tbl = Table(
-        title=(
-            f"[bold cyan]{project.name}[/]  /  [bold]{ver.version_name}[/]  "
-            f"·  [bold]{boards:,}[/] board{'s' if boards != 1 else ''}"
-        ),
-        box=box.ROUNDED, show_lines=True, pad_edge=True,
-    )
-    tbl.add_column("Ref", style="dim", no_wrap=True)
-    tbl.add_column("MPN", style="cyan", no_wrap=True)
-    tbl.add_column("Qty/board", justify="right")
-    tbl.add_column("Total qty", justify="right", style="dim")
-    tbl.add_column("Unit price", justify="right", style="green")
-    tbl.add_column("Line total", justify="right")
-    tbl.add_column("Per board", justify="right", style="bold")
-
-    total_per_board = Decimal("0")
-    grand_total = Decimal("0")
+    # ── Per-item calculations ─────────────────────────────────────────────
+    # Each row holds: (item, unit_1, total_1, unit_n, total_n, line_n)
+    rows: list[tuple] = []
+    pb_total_1 = Decimal("0")   # 1-board grand total
+    pb_total_n = Decimal("0")   # N-board grand total
 
     for item in summary.items:
-        total_qty = item.quantity * boards
-        unit_price = _best_price_at(item.price_breaks, total_qty)
-        line_total = unit_price * Decimal(total_qty) if unit_price is not None else None
-        per_board = line_total / Decimal(boards) if line_total is not None else None
+        qty_per_board = item.quantity
 
-        if per_board is not None:
-            total_per_board += per_board
-        if line_total is not None:
-            grand_total += line_total
+        # 1 board — unit price for qty_per_board units
+        unit_1 = _best_price_at(item.price_breaks, qty_per_board)
+        total_1 = unit_1 * Decimal(qty_per_board) if unit_1 is not None else None
+
+        # N boards — unit price for qty_per_board × N units (hits better tiers)
+        qty_n = qty_per_board * boards
+        unit_n = _best_price_at(item.price_breaks, qty_n)
+        line_n = unit_n * Decimal(qty_n) if unit_n is not None else None
+        per_board_n = line_n / Decimal(boards) if line_n is not None else None
+
+        if total_1 is not None:
+            pb_total_1 += total_1
+        if per_board_n is not None:
+            pb_total_n += per_board_n
+
+        rows.append((item, qty_per_board, unit_1, total_1, qty_n, unit_n, line_n, per_board_n))
+
+    # ── Comparison table ──────────────────────────────────────────────────
+    tbl = Table(
+        title=(
+            f"[bold cyan]{project.name}[/]  /  [bold]{ver.version_name}[/]  ·  "
+            f"Cost comparison: [bold]1[/] vs [bold]{boards:,}[/] boards"
+        ),
+        box=box.ROUNDED,
+        show_lines=True,
+        pad_edge=True,
+    )
+
+    # Columns: part info | ── 1 board ── | ── N boards ──── | saving
+    tbl.add_column("Ref",     style="dim",   no_wrap=True)
+    tbl.add_column("MPN",     style="cyan",  no_wrap=True)
+    # 1-board group
+    tbl.add_column("Qty",     justify="right", header_style="white")
+    tbl.add_column("Unit @1", justify="right", style="white",        header_style="white")
+    tbl.add_column("Total @1",justify="right", style="white",        header_style="white")
+    # N-board group
+    tbl.add_column(f"Qty×{boards:,}", justify="right", header_style="bold yellow")
+    tbl.add_column(f"Unit @{boards:,}", justify="right", style="green", header_style="bold yellow")
+    tbl.add_column(f"Total @{boards:,}", justify="right", style="green", header_style="bold yellow")
+    # Saving
+    tbl.add_column("Save/ea", justify="right", style="bold green", header_style="bold green")
+
+    for (item, qty_per_board, unit_1, total_1, qty_n, unit_n, line_n, per_board_n) in rows:
+        # Per-unit saving when buying for N boards vs 1 board
+        if unit_1 is not None and unit_n is not None and unit_n < unit_1:
+            saving = unit_1 - unit_n
+            pct = int(saving / unit_1 * 100)
+            saving_str = f"[green]-${saving:.4f}[/] [dim]({pct}%)[/]"
+        elif unit_1 is not None and unit_n is not None:
+            saving_str = "[dim]—[/]"
+        else:
+            saving_str = "[dim]?[/]"
 
         tbl.add_row(
             item.reference_designator,
             item.matched_mpn or item.user_part_name,
-            str(item.quantity),
-            f"{total_qty:,}",
-            _fmt_price(unit_price),
-            _fmt_price(line_total),
-            _fmt_price(per_board),
+            # 1 board
+            str(qty_per_board),
+            _fmt_price(unit_1),
+            _fmt_price(total_1),
+            # N boards
+            f"{qty_n:,}",
+            _fmt_price(unit_n),
+            _fmt_price(line_n),
+            # saving
+            saving_str,
         )
 
     console.print(tbl)
-    console.print(
-        f"\n  Per-board cost:  [bold green]${total_per_board:.4f}[/]"
+
+    # ── Summary section ───────────────────────────────────────────────────
+    grand_total_n = pb_total_n * Decimal(boards)
+
+    if pb_total_1 > 0:
+        saved_per_board = pb_total_1 - pb_total_n
+        pct_saved = int(saved_per_board / pb_total_1 * 100)
+        cheaper = saved_per_board > 0
+    else:
+        saved_per_board = Decimal("0")
+        pct_saved = 0
+        cheaper = False
+
+    console.print()
+    summary_tbl = Table(box=box.SIMPLE, show_header=False, pad_edge=True)
+    summary_tbl.add_column("label",  style="dim",        min_width=28)
+    summary_tbl.add_column("1 board",  justify="right",  style="white",       min_width=12)
+    summary_tbl.add_column(f"{boards:,} boards", justify="right", style="bold green", min_width=14)
+
+    summary_tbl.add_row(
+        "Per-board cost",
+        f"${pb_total_1:.4f}",
+        f"${pb_total_n:.4f}",
     )
-    console.print(
-        f"  Total ({boards:,} boards):  [bold green]${grand_total:.4f}[/]\n"
+    summary_tbl.add_row(
+        f"Total ({boards:,} boards)",
+        f"${pb_total_1 * boards:.4f}",
+        f"${grand_total_n:.4f}",
     )
+
+    console.print(summary_tbl)
+
+    if cheaper:
+        console.print(
+            f"  [bold green]You save ${saved_per_board:.4f}/board  ({pct_saved}% cheaper)[/]"
+            f"  when building [bold]{boards:,}[/] boards instead of 1.\n"
+        )
+    else:
+        console.print(
+            f"  [dim]No price tier improvement at {boards:,} boards for this BOM.[/]\n"
+        )
