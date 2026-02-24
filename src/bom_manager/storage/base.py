@@ -124,3 +124,15 @@ class StorageProtocol(Protocol):
         Upserts: overwrites any existing entry for the same key.
         """
         ...
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+
+    def get_setting(self, key: str) -> Optional[str]:
+        """Return the stored value for *key*, or None if not set."""
+        ...
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Upsert *value* for *key* in the settings table."""
+        ...

@@ -23,6 +23,20 @@ class PriceBreak(BaseModel):
     unit_price: Decimal = Field(..., ge=0, description="Unit price at this quantity tier")
 
 
+class SupplierSource(BaseModel):
+    """An alternative supplier source for a BOM item."""
+
+    model_config = ConfigDict(frozen=True)
+
+    supplier: str
+    supplier_part_number: Optional[str] = None
+    supplier_url: Optional[str] = None
+    matched_mpn: Optional[str] = None
+    unit_price: Optional[Decimal] = None
+    price_breaks: list["PriceBreak"] = Field(default_factory=list)
+    currency: str = "USD"
+
+
 class Project(BaseModel):
     """Top-level project container."""
 
@@ -80,6 +94,8 @@ class BOMItem(BaseModel):
     unit_price: Optional[Decimal] = Field(default=None, ge=0)
     price_breaks: list[PriceBreak] = Field(default_factory=list)
     total_price: Optional[Decimal] = Field(default=None, ge=0)
+    currency: str = Field(default="USD", description="ISO currency code for prices (USD or IRR)")
+    alt_sources: list[SupplierSource] = Field(default_factory=list)
 
     def effective_unit_price(self) -> Optional[Decimal]:
         """Return the best unit price for the current quantity from price breaks."""

@@ -15,10 +15,12 @@ dependencies = [
     "curl_cffi>=0.7.0",
     "playwright>=1.40.0",
     "openpyxl>=3.1.0",
+    "textual>=0.50.0",
+    "selectolax>=0.3.21",
 ]
 
 [project.scripts]
-bom = "bom_manager.interfaces.cli:cli"
+bom = "bom_manager.interfaces.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bom_manager"]

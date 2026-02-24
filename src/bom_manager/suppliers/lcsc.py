@@ -16,13 +16,16 @@ passes every WAF challenge, giving us the fully-rendered 800 KB DOM with all
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
+import queue
 import random
 import re
+import threading
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
@@ -47,6 +50,8 @@ SELECTORS: dict[str, str] = {
     # ── Search results page ──────────────────────────────────────────────────
     # Each product is a <tr id="productId{N}"> element
     "search_row": 'tr[id^="productId"]',
+    # Search input in the header — present on every LCSC page (homepage + search + detail)
+    "search_input": 'input[placeholder="Part #/ Keyword"]',
     # Inside a row, product-detail links appear in order: first=MPN, second=LCSC code
     "search_name_anchor": 'a[href*="/product-detail/"]',
     # Manufacturer brand link
@@ -94,7 +99,8 @@ SELECTORS: dict[str, str] = {
 
 _SUPPLIER_NAME = "LCSC"
 _BASE_URL = "https://www.lcsc.com"
-_SEARCH_URL = _BASE_URL + "/search?q={query}"
+_SEARCH_URL = _BASE_URL + "/search?q={query}&s_z=n_{query}"
+_HOME_URL = _BASE_URL + "/"
 _DETAIL_URL = _BASE_URL + "/product-detail/{pn}.html"
 
 _PAGE_TIMEOUT = 30_000   # ms — page.goto() hard timeout
@@ -149,43 +155,109 @@ class BrowserManager:
         self.slow_mo = slow_mo
         self._pw = None
         self._browser: Optional[Browser] = None
+        # Dedicated thread that owns the Playwright/greenlet context
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread: Optional[threading.Thread] = None
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Launch Playwright + Chromium.  Called automatically by ``__enter__``."""
-        self._pw = sync_playwright().start()
-        kwargs: dict[str, Any] = {
-            "headless": self.headless,
-            "slow_mo": self.slow_mo,
-        }
-        if self.proxy:
-            kwargs["proxy"] = {"server": self.proxy}
-        self._browser = self._pw.chromium.launch(**kwargs)
+        """Launch Playwright + Chromium in a dedicated thread.
+
+        Playwright's ``sync_playwright`` uses greenlets internally.  All calls
+        to the browser (goto, query_selector, etc.) must happen on the **same
+        OS thread** that called ``sync_playwright().start()``.  Running them in
+        different Textual worker threads causes a greenlet context error.
+
+        This method starts a single long-lived daemon thread that owns the
+        Playwright context.  All Playwright work is submitted to that thread
+        via :meth:`dispatch`.
+        """
+        ready: concurrent.futures.Future = concurrent.futures.Future()
+        self._thread = threading.Thread(
+            target=self._playwright_thread,
+            args=(ready,),
+            daemon=True,
+            name="playwright",
+        )
+        self._thread.start()
+        ready.result(timeout=60)  # block until browser is ready
         log.debug("BrowserManager: Chromium started (headless=%s, proxy=%s)", self.headless, self.proxy)
 
-    def stop(self) -> None:
-        """Close browser + Playwright.  Called automatically by ``__exit__``."""
-        if self._browser:
+    def _playwright_thread(self, ready: concurrent.futures.Future) -> None:
+        """Long-lived thread that owns the Playwright/greenlet context."""
+        try:
+            self._pw = sync_playwright().start()
+            kwargs: dict[str, Any] = {
+                "headless": self.headless,
+                "slow_mo": self.slow_mo,
+            }
+            if self.proxy:
+                kwargs["proxy"] = {"server": self.proxy}
+            self._browser = self._pw.chromium.launch(**kwargs)
+            ready.set_result(None)
+        except Exception as exc:
+            ready.set_exception(exc)
+            return
+
+        # Work loop — process dispatched callables until sentinel (None) received
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            fn, fut = item
             try:
+                fut.set_result(fn())
+            except Exception as exc:
+                fut.set_exception(exc)
+
+        # Cleanup (runs only after stop() sends the sentinel)
+        try:
+            if self._browser:
                 self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._pw:
-            try:
+        except Exception:
+            pass
+        try:
+            if self._pw:
                 self._pw.stop()
-            except Exception:
-                pass
-            self._pw = None
+        except Exception:
+            pass
+        self._browser = None
+        self._pw = None
+        log.debug("BrowserManager: Playwright thread exited cleanly")
+
+    def dispatch(self, fn: Callable) -> Any:
+        """Submit *fn* to the Playwright thread and block until it returns.
+
+        Can be called from **any** thread.  The callable runs in the dedicated
+        Playwright thread where the greenlet context lives.
+        """
+        if self._thread is None or not self._thread.is_alive():
+            raise RuntimeError(
+                "BrowserManager is not running.  Call start() first."
+            )
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        self._queue.put((fn, fut))
+        return fut.result()
+
+    def stop(self) -> None:
+        """Signal the Playwright thread to shut down and wait for it to exit."""
+        self._queue.put(None)  # sentinel
+        if self._thread:
+            self._thread.join(timeout=10)
+            self._thread = None
         log.debug("BrowserManager: stopped")
 
     @property
     def is_running(self) -> bool:
-        return self._browser is not None
+        return self._thread is not None and self._thread.is_alive()
 
-    def new_page(self) -> Page:
-        """Return a fresh ``Page`` with a standard 1440×900 viewport."""
+    def _new_page(self) -> Page:
+        """Return a fresh ``Page`` with a standard 1440×900 viewport.
+
+        Must only be called from within a :meth:`dispatch` callback (i.e. from
+        the Playwright thread).
+        """
         if not self._browser:
             raise RuntimeError(
                 "BrowserManager is not started. "
@@ -257,11 +329,8 @@ class LCSCSupplier:
             self._bm.start()
 
     def stop(self) -> None:
-        if self._page and not self._page.is_closed():
-            try:
-                self._page.context.close()
-            except Exception:
-                pass
+        # Page/context cleanup happens inside the browser thread when the
+        # BrowserManager closes the browser.  Just clear the local reference.
         self._page = None
         if self._owns_browser:
             self._bm.stop()
@@ -281,6 +350,9 @@ class LCSCSupplier:
 
         Returns an empty list when nothing matches or a CAPTCHA is detected.
         Raises ``SupplierNetworkError`` on page-load failure.
+
+        Thread-safe: can be called from any thread.  The actual Playwright
+        work runs in the dedicated browser thread via :meth:`BrowserManager.dispatch`.
         """
         cache_key = f"search:{query.lower().strip()}"
         cached = self._get_cache(_SUPPLIER_NAME, cache_key)
@@ -288,6 +360,17 @@ class LCSCSupplier:
             log.debug("Cache hit: search %r", query)
             return [PartResult(**item) for item in cached]
 
+        results = self._bm.dispatch(lambda: self._search_playwright(query))
+
+        if results:
+            self._set_cache(
+                _SUPPLIER_NAME, cache_key,
+                [r.model_dump(mode="json") for r in results],
+            )
+        return results
+
+    def _search_playwright(self, query: str) -> list[PartResult]:
+        """Playwright work for :meth:`search` — runs inside the browser thread."""
         page = self._get_page()
         url = _SEARCH_URL.format(query=query)
         self._navigate(page, url, wait_selector=SELECTORS["search_row"])
@@ -302,12 +385,6 @@ class LCSCSupplier:
 
         results = _parse_search_rows(page, self._max_results)
         log.debug("LCSC: search %r → %d results", query, len(results))
-
-        if results:
-            self._set_cache(
-                _SUPPLIER_NAME, cache_key,
-                [r.model_dump(mode="json") for r in results],
-            )
         return results
 
     def get_part(self, part_number: str) -> PartDetail:
@@ -316,12 +393,21 @@ class LCSCSupplier:
 
         Raises ``PartNotFoundError`` when the part does not exist.
         Raises ``SupplierNetworkError`` on page-load or CAPTCHA failure.
+
+        Thread-safe: can be called from any thread.  The actual Playwright
+        work runs in the dedicated browser thread via :meth:`BrowserManager.dispatch`.
         """
         cached = self._get_cache(_SUPPLIER_NAME, part_number)
         if cached is not None:
             log.debug("Cache hit: part %r", part_number)
             return PartDetail(**cached)
 
+        detail = self._bm.dispatch(lambda: self._get_part_playwright(part_number))
+        self._set_cache(_SUPPLIER_NAME, part_number, detail.model_dump(mode="json"))
+        return detail
+
+    def _get_part_playwright(self, part_number: str) -> PartDetail:
+        """Playwright work for :meth:`get_part` — runs inside the browser thread."""
         page = self._get_page()
         url = _DETAIL_URL.format(pn=part_number)
         self._navigate(page, url, wait_selector=SELECTORS["detail_ready"])
@@ -331,17 +417,42 @@ class LCSCSupplier:
                 f"CAPTCHA detected while fetching part {part_number!r}"
             )
 
-        detail = _parse_detail_page(page, part_number)
-        self._set_cache(_SUPPLIER_NAME, part_number, detail.model_dump(mode="json"))
-        return detail
+        return _parse_detail_page(page, part_number)
 
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _get_page(self) -> Page:
-        """Return the shared page, lazily creating one if needed."""
+        """Return the shared page, lazily creating one if needed.
+
+        A new page triggers a homepage warm-up to establish session cookies —
+        LCSC's Vue SPA requires prior homepage navigation for search to render.
+
+        Must only be called from within a :meth:`BrowserManager.dispatch` callback
+        (i.e. from the Playwright thread).
+        """
         if self._page is None or self._page.is_closed():
-            self._page = self._bm.new_page()
+            self._page = self._bm._new_page()
+            self._warm_up_page(self._page)
         return self._page
+
+    def _warm_up_page(self, page: Page) -> None:
+        """Visit the LCSC homepage and wait for Vue to fully initialise.
+
+        LCSC is a Vue SPA — the search page only renders results when the
+        browser has visited the homepage first so that Vue can bootstrap its
+        session state.  We wait for the search-input element to appear rather
+        than using a fixed sleep, which is both faster and more reliable.
+        """
+        try:
+            self._throttle()
+            page.goto(_HOME_URL, wait_until="domcontentloaded", timeout=_PAGE_TIMEOUT)
+            # Wait until Vue has rendered the search box — that signals the
+            # app is fully initialised and cookies/state are in place.
+            page.wait_for_selector(SELECTORS["search_input"], timeout=15_000)
+            log.debug("LCSC: homepage warm-up complete (Vue ready)")
+        except Exception as exc:
+            log.debug("LCSC: warm-up failed (continuing anyway): %s", exc)
+
 
     def _navigate(self, page: Page, url: str, *, wait_selector: str) -> None:
         """Navigate to *url*, throttle, then wait for *wait_selector*.
@@ -716,8 +827,21 @@ def _extract_description(td_texts: list[str]) -> str:
 
     The specs/features string is usually the longest TD beyond index 10,
     containing comma-separated electronic attributes like "2.4GHz I2C GPIO…".
+    Price/UI artifacts such as "Add Ext. Price: $0.21 Full Reel: 4,000" are
+    excluded by the helper below.
     """
-    candidates = [t for t in td_texts[10:] if len(t) > 20 and "," in t]
+    def _is_specs(t: str) -> bool:
+        if len(t) < 20 or "," not in t:
+            return False
+        if "$" in t:
+            return False
+        if t.startswith("Add "):
+            return False
+        if re.search(r"(?i)(full\s*reel|cut\s*tape|tape[\s\-]reel)", t):
+            return False
+        return True
+
+    candidates = [t for t in td_texts[10:] if _is_specs(t)]
     return candidates[0] if candidates else ""
 
 

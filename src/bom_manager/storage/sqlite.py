@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import UUID
 
-from bom_manager.core.models import BOMItem, PriceBreak, Project, ProjectVersion
+from bom_manager.core.models import BOMItem, PriceBreak, Project, ProjectVersion, SupplierSource
 
 _DEFAULT_DB_PATH = Path("data/bom.db")
 _DEFAULT_CACHE_TTL = 24 * 60 * 60  # 24 hours in seconds
@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS part_cache (
     fetched_at  TEXT NOT NULL,
     PRIMARY KEY (supplier, part_number)
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 # ---------------------------------------------------------------------------
@@ -100,7 +105,26 @@ class SQLiteStorage:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_DDL)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Apply incremental schema migrations for existing databases."""
+        # Add currency column to bom_items (added in v0.2.0)
+        try:
+            self._conn.execute(
+                "ALTER TABLE bom_items ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'"
+            )
+        except Exception:
+            pass  # Column already exists — safe to ignore
+
+        # Add alt_sources column to bom_items (added in v0.3.0)
+        try:
+            self._conn.execute(
+                "ALTER TABLE bom_items ADD COLUMN alt_sources TEXT NOT NULL DEFAULT '[]'"
+            )
+        except Exception:
+            pass  # Column already exists — safe to ignore
 
     def close(self) -> None:
         self._conn.close()
@@ -202,8 +226,8 @@ class SQLiteStorage:
             INSERT INTO bom_items (
                 id, version_id, reference_designator, user_part_name,
                 matched_mpn, supplier, supplier_part_number, supplier_url,
-                quantity, unit_price, price_breaks, total_price
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                quantity, unit_price, price_breaks, total_price, currency, alt_sources
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _item_to_row(item),
         )
@@ -224,7 +248,9 @@ class SQLiteStorage:
                 quantity             = ?,
                 unit_price           = ?,
                 price_breaks         = ?,
-                total_price          = ?
+                total_price          = ?,
+                currency             = ?,
+                alt_sources          = ?
             WHERE id = ?
             """,
             _item_to_row(item)[1:] + (_item_to_row(item)[0],),
@@ -295,6 +321,26 @@ class SQLiteStorage:
         )
         self._conn.commit()
 
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+
+    def get_setting(self, key: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        self._conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # Row <-> Model converters
@@ -329,6 +375,32 @@ def _row_to_item(row: sqlite3.Row) -> BOMItem:
         )
         for pb in price_breaks_raw
     ]
+    # currency column added in migration; fall back to "USD" for pre-migration rows
+    keys = row.keys()
+    currency = row["currency"] if "currency" in keys else "USD"
+    # alt_sources column added in migration; fall back to [] for pre-migration rows
+    try:
+        alt_sources_raw = json.loads(row["alt_sources"] or "[]")
+    except Exception:
+        alt_sources_raw = []
+    alt_sources = [
+        SupplierSource(
+            supplier=s["supplier"],
+            supplier_part_number=s.get("supplier_part_number"),
+            supplier_url=s.get("supplier_url"),
+            matched_mpn=s.get("matched_mpn"),
+            unit_price=Decimal(s["unit_price"]) if s.get("unit_price") else None,
+            price_breaks=[
+                PriceBreak(
+                    min_quantity=pb["min_quantity"],
+                    unit_price=Decimal(pb["unit_price"]),
+                )
+                for pb in s.get("price_breaks", [])
+            ],
+            currency=s.get("currency", "USD"),
+        )
+        for s in alt_sources_raw
+    ]
     return BOMItem(
         id=UUID(row["id"]),
         version_id=UUID(row["version_id"]),
@@ -342,6 +414,8 @@ def _row_to_item(row: sqlite3.Row) -> BOMItem:
         unit_price=_decimal_or_none(row["unit_price"]),
         price_breaks=price_breaks,
         total_price=_decimal_or_none(row["total_price"]),
+        currency=currency or "USD",
+        alt_sources=alt_sources,
     )
 
 
@@ -350,6 +424,23 @@ def _item_to_row(item: BOMItem) -> tuple[Any, ...]:
         [
             {"min_quantity": pb.min_quantity, "unit_price": str(pb.unit_price)}
             for pb in item.price_breaks
+        ]
+    )
+    alt_sources_json = json.dumps(
+        [
+            {
+                "supplier": s.supplier,
+                "supplier_part_number": s.supplier_part_number,
+                "supplier_url": s.supplier_url,
+                "matched_mpn": s.matched_mpn,
+                "unit_price": str(s.unit_price) if s.unit_price is not None else None,
+                "price_breaks": [
+                    {"min_quantity": pb.min_quantity, "unit_price": str(pb.unit_price)}
+                    for pb in s.price_breaks
+                ],
+                "currency": s.currency,
+            }
+            for s in item.alt_sources
         ]
     )
     return (
@@ -365,4 +456,6 @@ def _item_to_row(item: BOMItem) -> tuple[Any, ...]:
         str(item.unit_price) if item.unit_price is not None else None,
         price_breaks_json,
         str(item.total_price) if item.total_price is not None else None,
+        item.currency,
+        alt_sources_json,
     )

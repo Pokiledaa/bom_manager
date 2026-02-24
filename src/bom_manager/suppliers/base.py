@@ -28,6 +28,7 @@ class PartDetail(PartResult):
     price_breaks: list[PriceBreakInfo] = Field(default_factory=list)
     stock: int = Field(default=0, ge=0)
     datasheet_url: Optional[str] = Field(default=None)
+    currency: str = Field(default="USD", description="ISO currency code for prices (USD or IRR)")
 
     def best_unit_price(self, quantity: int = 1) -> Optional[Decimal]:
         """Return the lowest unit price for the given order quantity."""

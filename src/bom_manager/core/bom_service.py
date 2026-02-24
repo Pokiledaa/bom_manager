@@ -16,7 +16,7 @@ from bom_manager.core.exceptions import (
     SupplierLookupError,
     VersionNotFoundError,
 )
-from bom_manager.core.models import BOMItem, BOMSummary, PriceBreak, ProjectVersion
+from bom_manager.core.models import BOMItem, BOMSummary, PriceBreak, ProjectVersion, SupplierSource
 from bom_manager.storage.base import StorageProtocol
 from bom_manager.suppliers.base import PartDetail, PartResult, SupplierError, SupplierProtocol
 
@@ -81,6 +81,56 @@ class BOMService:
         if self._supplier is None:
             raise RuntimeError("No supplier configured — create BOMService with a supplier to use search")
         return self._supplier.search(query)
+
+    @staticmethod
+    def search_parts_all(
+        query: str,
+        suppliers: list,
+    ) -> tuple[list[tuple[str, PartResult]], list[tuple[str, str]]]:
+        """Search *suppliers* sequentially and return results + any failures.
+
+        Returns
+        -------
+        (results, failures)
+
+        results:
+            list of (supplier_name, PartResult) tuples, ordered by supplier
+            then result rank.
+        failures:
+            list of (supplier_name, error_message) for each supplier that
+            raised an exception during search.  Empty when all succeed.
+
+        Parameters
+        ----------
+        query:
+            The search term.
+        suppliers:
+            List of supplier instances satisfying ``SupplierProtocol``.
+
+        Note
+        ----
+        Suppliers are searched **sequentially** in the calling thread rather
+        than in a ``ThreadPoolExecutor``.  This is required because LCSC uses
+        Playwright's sync API, which relies on greenlets and must be called
+        from the same OS thread that launched the Playwright context.  Running
+        it in a pool thread triggers a "Cannot switch to a different thread"
+        greenlet error at runtime.  With the dedicated Playwright thread in
+        ``BrowserManager``, LCSC calls are now thread-safe via dispatch(), but
+        sequential ordering is kept for predictable result ordering.
+        """
+        combined: list[tuple[str, PartResult]] = []
+        failures: list[tuple[str, str]] = []
+        for s in suppliers:
+            try:
+                for r in s.search(query):
+                    combined.append((s.name, r))
+            except Exception as exc:
+                log.warning(
+                    "search_parts_all: supplier %r failed for %r: %s",
+                    s.name, query, exc,
+                )
+                failures.append((s.name, str(exc)))
+        return combined, failures
 
     # ------------------------------------------------------------------
     # Add part
@@ -178,6 +228,49 @@ class BOMService:
             quantity,
             saved.unit_price,
             version_id,
+        )
+        return saved
+
+    def add_part_manual(
+        self,
+        version_id: UUID,
+        user_part_name: str,
+        quantity: int,
+        reference_designator: str,
+        unit_price: Decimal,
+        currency: str = "USD",
+    ) -> BOMItem:
+        """Add a part with a manually entered price (no supplier lookup).
+
+        Parameters
+        ----------
+        unit_price:
+            Price per unit in the given *currency*.
+        currency:
+            "USD" or "IRR".
+        """
+        if self._storage.get_version(version_id) is None:
+            raise VersionNotFoundError(f"Version {version_id} not found")
+
+        total_price = unit_price * Decimal(quantity)
+        item = BOMItem(
+            version_id=version_id,
+            reference_designator=reference_designator,
+            user_part_name=user_part_name,
+            matched_mpn=None,
+            supplier="manual",
+            supplier_part_number=None,
+            supplier_url=None,
+            quantity=quantity,
+            unit_price=unit_price,
+            price_breaks=[],
+            total_price=total_price,
+            currency=currency,
+        )
+        saved = self._storage.add_item(item)
+        log.info(
+            "Added manual item %r × %d @ %s %s to version %s",
+            user_part_name, quantity, unit_price, currency, version_id,
         )
         return saved
 
@@ -445,6 +538,72 @@ class BOMService:
         return VersionDiff(added=added, removed=removed, changed=changed)
 
     # ------------------------------------------------------------------
+    # Multi-source management
+    # ------------------------------------------------------------------
+
+    def add_source_to_item(
+        self, version_id: UUID, item_id: UUID, source: SupplierSource
+    ) -> BOMItem:
+        """Append an alternative supplier source to an existing BOM item."""
+        item = self._get_item(version_id, item_id)
+        updated = item.model_copy(update={"alt_sources": [*item.alt_sources, source]})
+        return self._storage.update_item(updated)
+
+    def use_source(
+        self, version_id: UUID, item_id: UUID, alt_index: int
+    ) -> BOMItem:
+        """Promote alt_sources[alt_index] (0-based) to primary; push old primary into alts.
+
+        Raises
+        ------
+        ValueError
+            If alt_index is out of range.
+        """
+        item = self._get_item(version_id, item_id)
+        if not (0 <= alt_index < len(item.alt_sources)):
+            raise ValueError(
+                f"alt_index {alt_index} out of range "
+                f"(0..{len(item.alt_sources) - 1})"
+            )
+        new_primary = item.alt_sources[alt_index]
+        old_primary = SupplierSource(
+            supplier=item.supplier or "manual",
+            supplier_part_number=item.supplier_part_number,
+            supplier_url=item.supplier_url,
+            matched_mpn=item.matched_mpn,
+            unit_price=item.unit_price,
+            price_breaks=list(item.price_breaks),
+            currency=item.currency,
+        )
+        new_alts = [
+            s for i, s in enumerate(item.alt_sources) if i != alt_index
+        ] + [old_primary]
+
+        new_unit_price = (
+            _best_unit_price_for_qty(list(new_primary.price_breaks), item.quantity)
+            if new_primary.price_breaks
+            else new_primary.unit_price
+        )
+        new_total = (
+            new_unit_price * Decimal(item.quantity)
+            if new_unit_price is not None
+            else None
+        )
+
+        updated = item.model_copy(update={
+            "supplier": new_primary.supplier,
+            "supplier_part_number": new_primary.supplier_part_number,
+            "supplier_url": new_primary.supplier_url,
+            "matched_mpn": new_primary.matched_mpn,
+            "unit_price": new_unit_price,
+            "price_breaks": list(new_primary.price_breaks),
+            "total_price": new_total,
+            "currency": new_primary.currency,
+            "alt_sources": new_alts,
+        })
+        return self._storage.update_item(updated)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -465,20 +624,24 @@ class BOMService:
 
 
 def _best_unit_price_for_qty(
-    detail: PartDetail, quantity: int
+    price_breaks: list, quantity: int
 ) -> Optional[Decimal]:
     """
-    Pick the lowest unit price from *detail.price_breaks* that applies at
-    *quantity*.  Falls back to the cheapest available break when quantity
-    is below all thresholds (e.g. sampling one unit of a reel part).
+    Pick the lowest unit price from *price_breaks* that applies at *quantity*.
+
+    Falls back to the cheapest available break when quantity is below all
+    thresholds (e.g. sampling one unit of a reel part).
+
+    Accepts any objects with ``min_quantity`` and ``unit_price`` attributes,
+    including both ``PriceBreak`` (domain model) and ``PriceBreakInfo`` (supplier).
     """
-    if not detail.price_breaks:
+    if not price_breaks:
         return None
-    eligible = [pb for pb in detail.price_breaks if pb.min_quantity <= quantity]
+    eligible = [pb for pb in price_breaks if pb.min_quantity <= quantity]
     if eligible:
         return min(eligible, key=lambda pb: pb.unit_price).unit_price
-    # quantity is below the minimum break — return the first (highest) price
-    return min(detail.price_breaks, key=lambda pb: pb.min_quantity).unit_price
+    # quantity is below the minimum break — return the first (lowest min qty) price
+    return min(price_breaks, key=lambda pb: pb.min_quantity).unit_price
 
 
 def _build_item(
@@ -499,7 +662,7 @@ def _build_item(
         )
         for pb in detail.price_breaks
     ]
-    unit_price = _best_unit_price_for_qty(detail, quantity)
+    unit_price = _best_unit_price_for_qty(detail.price_breaks, quantity)
     total_price = unit_price * Decimal(quantity) if unit_price is not None else None
 
     return BOMItem(
@@ -514,6 +677,7 @@ def _build_item(
         unit_price=unit_price,
         price_breaks=price_breaks,
         total_price=total_price,
+        currency=getattr(detail, "currency", "USD"),
     )
 
 
